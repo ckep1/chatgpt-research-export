@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Deep Research Markdown Exporter
 // @namespace    https://github.com/ckep1/chatgpt-research-export
-// @version      2.1.0
+// @version      2.1.1
 // @description  Export ChatGPT conversations and deep research content as markdown with configurable citation styles
 // @author       Chris Kephart
 // @match        https://chatgpt.com/*
@@ -291,7 +291,7 @@
 
     function processNode(node) {
       if (node.nodeType === Node.TEXT_NODE) {
-        return node.textContent;
+        return node.textContent.replace(/\$/g, "\\$");
       }
       if (node.nodeType !== Node.ELEMENT_NODE) {
         return "";
