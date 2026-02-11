@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         ChatGPT Deep Research Markdown Exporter
 // @namespace    https://github.com/ckep1/chatgpt-research-export
-// @version      2.0.0
+// @version      2.1.0
 // @description  Export ChatGPT conversations and deep research content as markdown with configurable citation styles
 // @author       Chris Kephart
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
+// @match        https://*.web-sandbox.oaiusercontent.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @run-at       document-idle
@@ -14,6 +15,12 @@
 
 (function () {
   "use strict";
+
+  // ============================================================================
+  // CONTEXT DETECTION
+  // ============================================================================
+
+  const IS_IFRAME_CONTEXT = window.location.hostname.includes("web-sandbox.oaiusercontent.com");
 
   // ============================================================================
   // CONFIGURATION & CONSTANTS
@@ -75,12 +82,14 @@
   // ============================================================================
 
   function getPreferences() {
+    // GM_getValue may not be available in cross-origin iframe contexts
+    const getter = typeof GM_getValue === "function" ? GM_getValue : (_, def) => def;
     return {
-      citationStyle: GM_getValue("citationStyle", CITATION_STYLES.PARENTHESIZED),
-      addExtraNewlines: GM_getValue("addExtraNewlines", false),
-      exportMethod: GM_getValue("exportMethod", EXPORT_METHODS.DOWNLOAD),
-      includeFrontmatter: GM_getValue("includeFrontmatter", true),
-      titleAsH1: GM_getValue("titleAsH1", false),
+      citationStyle: getter("citationStyle", CITATION_STYLES.PARENTHESIZED),
+      addExtraNewlines: getter("addExtraNewlines", false),
+      exportMethod: getter("exportMethod", EXPORT_METHODS.DOWNLOAD),
+      includeFrontmatter: getter("includeFrontmatter", true),
+      titleAsH1: getter("titleAsH1", false),
     };
   }
 
@@ -133,7 +142,8 @@
   // TITLE & CONTENT EXTRACTION
   // ============================================================================
 
-  function extractResearchTitle() {
+  function extractResearchTitle(overrideTitle) {
+    if (overrideTitle) return overrideTitle;
     const container = document.querySelector(".deep-research-result");
     if (container) {
       const h1 = container.querySelector("h1");
@@ -142,17 +152,90 @@
     return cleanTitle() || "ChatGPT Research";
   }
 
+  function hasDeepResearch() {
+    return !!document.querySelector(".deep-research-result") ||
+      !!document.querySelector('iframe[title="internal://deep-research"]');
+  }
+
   function extractResearchContent() {
+    // Try legacy .deep-research-result first
     const container = document.querySelector(".deep-research-result");
-    if (!container) return null;
+    if (container) {
+      const prefs = getPreferences();
+      globalCitations.reset();
 
-    const prefs = getPreferences();
-    globalCitations.reset();
+      const markdown = htmlToMarkdown(container, prefs.citationStyle);
+      if (!markdown || !markdown.trim()) return null;
 
-    const markdown = htmlToMarkdown(container, prefs.citationStyle);
-    if (!markdown || !markdown.trim()) return null;
+      return formatResearchDocument(markdown.trim());
+    }
 
-    return formatResearchDocument(markdown.trim());
+    // If no legacy container, check for cross-origin iframe
+    const iframe = document.querySelector('iframe[title="internal://deep-research"]');
+    if (iframe) {
+      // This path is async - handled by extractResearchFromIframe()
+      return null;
+    }
+
+    return null;
+  }
+
+  function extractResearchFromIframe() {
+    return new Promise((resolve) => {
+      const iframe = document.querySelector('iframe[title="internal://deep-research"]');
+      if (!iframe || !iframe.contentWindow) {
+        resolve(null);
+        return;
+      }
+
+      const prefs = getPreferences();
+      let responded = false;
+
+      function handleResponse(event) {
+        if (responded) return;
+        if (!event.data || event.data.type !== "chatgpt-export-response") return;
+        responded = true;
+        window.removeEventListener("message", handleResponse);
+
+        const { markdown, title, citations } = event.data;
+
+        if (!markdown || !markdown.trim()) {
+          resolve(null);
+          return;
+        }
+
+        // Restore citation state from iframe data
+        globalCitations.reset();
+        if (citations) {
+          for (const [numStr, data] of Object.entries(citations)) {
+            const num = parseInt(numStr, 10);
+            globalCitations.urlToNumber.set(data.normalizedUrl, num);
+            globalCitations.citationRefs.set(num, data);
+            if (num >= globalCitations.nextCitationNumber) {
+              globalCitations.nextCitationNumber = num + 1;
+            }
+          }
+        }
+
+        resolve(formatResearchDocument(markdown.trim(), title));
+      }
+
+      window.addEventListener("message", handleResponse);
+
+      iframe.contentWindow.postMessage({
+        type: "chatgpt-export-request",
+        citationStyle: prefs.citationStyle,
+      }, "*");
+
+      // Timeout after 10 seconds
+      setTimeout(() => {
+        if (!responded) {
+          responded = true;
+          window.removeEventListener("message", handleResponse);
+          resolve(null);
+        }
+      }, 10000);
+    });
   }
 
   function extractConversationContent() {
@@ -203,7 +286,7 @@
   // HTML TO MARKDOWN CONVERSION
   // ============================================================================
 
-  function htmlToMarkdown(rootElement, citationStyle) {
+  function htmlToMarkdown(rootElement, citationStyle, citationUrlMap) {
     const prefs = getPreferences();
 
     function processNode(node) {
@@ -226,6 +309,21 @@
         }
         const href = node.getAttribute("href");
         const text = processChildren(node);
+
+        // Detect citation links: numeric text inside <sup> (iframe deep research format)
+        const inSup = node.parentElement && node.parentElement.tagName.toLowerCase() === "sup";
+        if (inSup && /^\d+$/.test(text.trim())) {
+          const num = globalCitations.addCitation(href);
+          const domain = extractDomainName(href) || "source";
+          if (citationStyle === CITATION_STYLES.NONE) return "";
+          if (citationStyle === CITATION_STYLES.ENDNOTES) return `[${num}]`;
+          if (citationStyle === CITATION_STYLES.FOOTNOTES) return `[^${num}]`;
+          if (citationStyle === CITATION_STYLES.INLINE) return `[${num}](${href})`;
+          if (citationStyle === CITATION_STYLES.PARENTHESIZED) return `([${num}](${href}))`;
+          if (citationStyle === CITATION_STYLES.NAMED) return `([${domain}](${href}))`;
+          return `[${num}]`;
+        }
+
         if (citationStyle === CITATION_STYLES.NONE) {
           return text;
         }
@@ -282,11 +380,35 @@
           return children;
         case "hr":
           return "\n---\n\n";
+        case "svg":
+        case "path":
+          return "";
+        case "sup": {
+          const supText = children.trim();
+          if (/^\d+$/.test(supText) && citationUrlMap) {
+            const urls = citationUrlMap.get(node);
+            if (urls && urls.length > 0) {
+              if (citationStyle === CITATION_STYLES.NONE) return "";
+              const parts = urls.map((url) => {
+                const num = globalCitations.addCitation(url);
+                const domain = extractDomainName(url) || "source";
+                if (citationStyle === CITATION_STYLES.ENDNOTES) return `[${num}]`;
+                if (citationStyle === CITATION_STYLES.FOOTNOTES) return `[^${num}]`;
+                if (citationStyle === CITATION_STYLES.INLINE) return `[${num}](${url})`;
+                if (citationStyle === CITATION_STYLES.PARENTHESIZED) return `([${num}](${url}))`;
+                if (citationStyle === CITATION_STYLES.NAMED) return `([${domain}](${url}))`;
+                return `[${num}]`;
+              });
+              return parts.join("");
+            }
+            return `[${supText}]`;
+          }
+          return children;
+        }
         case "div":
         case "section":
         case "article":
         case "span":
-        case "sup":
           return children;
         default:
           return children;
@@ -358,7 +480,7 @@
       const headerRows = tableNode.querySelectorAll("thead tr");
       if (headerRows.length > 0) {
         headerRows.forEach((row) => {
-          const cells = Array.from(row.querySelectorAll("th, td")).map((cell) => cell.textContent.trim() || " ");
+          const cells = Array.from(row.querySelectorAll("th, td")).map((cell) => processChildren(cell).replace(/\n/g, " ").trim() || " ");
           if (cells.length > 0) {
             rows.push(`| ${cells.join(" | ")} |`);
             rows.push(`| ${cells.map(() => "---").join(" | ")} |`);
@@ -367,7 +489,7 @@
       }
       const bodyRows = tableNode.querySelectorAll("tbody tr");
       bodyRows.forEach((row) => {
-        const cells = Array.from(row.querySelectorAll("td")).map((cell) => cell.textContent.trim() || " ");
+        const cells = Array.from(row.querySelectorAll("td")).map((cell) => processChildren(cell).replace(/\n/g, " ").trim() || " ");
         if (cells.length > 0) {
           rows.push(`| ${cells.join(" | ")} |`);
         }
@@ -422,8 +544,8 @@
     return markdown;
   }
 
-  function formatResearchDocument(content) {
-    const title = extractResearchTitle();
+  function formatResearchDocument(content, overrideTitle) {
+    const title = extractResearchTitle(overrideTitle);
     const prefs = getPreferences();
 
     let markdown = "";
@@ -484,6 +606,47 @@
       return true;
     } catch (err) {
       return false;
+    }
+  }
+
+  async function doExportAsync(extractFn, filenameSuffix, button) {
+    const originalText = button.textContent;
+    button.textContent = "Exporting...";
+    button.disabled = true;
+
+    try {
+      const markdown = await extractFn();
+      if (!markdown) {
+        alert("No content found to export. The iframe may not have responded.");
+        return;
+      }
+
+      const prefs = getPreferences();
+
+      if (prefs.exportMethod === EXPORT_METHODS.CLIPBOARD) {
+        const success = await copyToClipboard(markdown);
+        if (success) {
+          button.textContent = "Copied!";
+          setTimeout(() => {
+            button.textContent = originalText;
+          }, 2000);
+          return;
+        } else {
+          alert("Failed to copy to clipboard. Please try again.");
+        }
+      } else {
+        const title = cleanTitle();
+        const safeTitle = makeSafeFilename(title);
+        const filename = `${safeTitle || "chatgpt"}-${filenameSuffix}.md`;
+        downloadMarkdown(markdown, filename);
+      }
+    } catch (error) {
+      alert("Export failed. Please try again.");
+    } finally {
+      if (button.textContent !== "Copied!") {
+        button.textContent = originalText;
+      }
+      button.disabled = false;
     }
   }
 
@@ -591,7 +754,13 @@
     researchBtn.id = "chatgpt-export-research-btn";
     researchBtn.style.display = "none";
     researchBtn.addEventListener("click", () => {
-      doExport(extractResearchContent, "research", researchBtn);
+      // Check if research is in a cross-origin iframe
+      const iframe = document.querySelector('iframe[title="internal://deep-research"]');
+      if (iframe && !document.querySelector(".deep-research-result")) {
+        doExportAsync(extractResearchFromIframe, "research", researchBtn);
+      } else {
+        doExport(extractResearchContent, "research", researchBtn);
+      }
       if (closeMenuFn) closeMenuFn();
     });
 
@@ -715,7 +884,7 @@
     if (!controlsContainer) return;
 
     const hasTurns = document.querySelectorAll('article[data-testid^="conversation-turn"]').length > 0;
-    const hasResearch = !!document.querySelector(".deep-research-result");
+    const hasResearch = hasDeepResearch();
     const showAny = hasTurns || hasResearch;
 
     conversationBtn.style.display = hasTurns ? "" : "none";
@@ -884,10 +1053,173 @@
   }
 
   // ============================================================================
+  // CITATION URL EXTRACTION (React fiber traversal for iframe content)
+  // ============================================================================
+
+  function extractCitationUrls(doc) {
+    const map = new Map();
+    const sups = doc.querySelectorAll("sup");
+    const citationSups = [];
+
+    for (const sup of sups) {
+      const text = sup.textContent.trim();
+      if (/^\d+$/.test(text)) citationSups.push(sup);
+    }
+
+    if (citationSups.length === 0) return map;
+
+    // For each citation sup, resolve its URL(s) from React fiber item prop
+    // Citations can reference multiple sources (nested/grouped citations)
+    for (const sup of citationSups) {
+      // Try the item prop from the citation's own fiber (level 2, sXn component)
+      const fk = Object.keys(sup).find((k) => k.startsWith("__reactFiber"));
+      if (fk) {
+        let node = sup[fk];
+        for (let i = 0; i < 5 && node; i++) {
+          const props = node.memoizedProps || node.pendingProps;
+          if (props && props.item) {
+            const item = props.item;
+            const urls = [];
+
+            // Primary: item.reference.safe_urls (array of grouped URLs)
+            if (item.reference && Array.isArray(item.reference.safe_urls)) {
+              for (const u of item.reference.safe_urls) {
+                if (typeof u === "string" && /^https?:\/\//.test(u)) {
+                  urls.push(u.replace(/[?&]utm_source=chatgpt\.com/, ""));
+                }
+              }
+            }
+
+            // Fallback: item.url (single URL)
+            if (urls.length === 0 && item.url) {
+              urls.push(item.url.replace(/[?&]utm_source=chatgpt\.com/, ""));
+            }
+
+            const unique = [...new Set(urls)];
+            if (unique.length > 0) { map.set(sup, unique); break; }
+          }
+          node = node.return;
+        }
+      }
+    }
+
+    return map;
+  }
+
+  // ============================================================================
+  // IFRAME BRIDGE (runs inside the deep research sandbox iframe)
+  // ============================================================================
+
+  function initIframeBridge() {
+    // The sandbox iframe contains a nested iframe with the actual content.
+    // This nested iframe is same-origin and directly accessible.
+    function getContentDocument() {
+      const nested = document.querySelector("iframe");
+      if (nested) {
+        try {
+          const doc = nested.contentDocument;
+          if (doc && doc.body && doc.body.textContent.trim().length > 100) return doc;
+        } catch (e) { /* cross-origin, fall through */ }
+      }
+      return document;
+    }
+
+    function findReportContainer() {
+      const doc = getContentDocument();
+      const candidates = ["main", "article", ".report", ".content"];
+      for (const sel of candidates) {
+        const el = doc.querySelector(sel);
+        if (el && el.textContent.trim().length > 200) return el;
+      }
+      // Fallback: find the container with the most text content that has an h1
+      const divs = doc.querySelectorAll("div");
+      let best = null;
+      let bestLen = 0;
+      for (const div of divs) {
+        const h1 = div.querySelector("h1");
+        if (h1 && div.textContent.trim().length > bestLen) {
+          bestLen = div.textContent.trim().length;
+          best = div;
+        }
+      }
+      return best || doc.body;
+    }
+
+    function extractTitle() {
+      const doc = getContentDocument();
+      const h1 = doc.querySelector("h1");
+      return h1 ? h1.textContent.trim() : "ChatGPT Research";
+    }
+
+    function waitForContent() {
+      return new Promise((resolve) => {
+        function hasContent() {
+          const doc = getContentDocument();
+          return doc.querySelector("h1") && doc.body.textContent.trim().length > 200;
+        }
+        if (hasContent()) { resolve(); return; }
+        // Poll for content (MutationObserver can't watch across iframe boundaries)
+        const interval = setInterval(() => {
+          if (hasContent()) { clearInterval(interval); resolve(); }
+        }, 500);
+        setTimeout(() => { clearInterval(interval); resolve(); }, 15000);
+      });
+    }
+
+    waitForContent().then(() => {
+      // Clean up temp element if present
+      const tempLink = document.getElementById("__iframe_link");
+      if (tempLink) tempLink.remove();
+
+      window.addEventListener("message", (event) => {
+        if (!event.data || event.data.type !== "chatgpt-export-request") return;
+
+        const citationStyle = event.data.citationStyle || CITATION_STYLES.PARENTHESIZED;
+        globalCitations.reset();
+
+        const container = findReportContainer();
+        const doc = getContentDocument();
+
+        // Extract citation URLs from React fiber before converting to markdown
+        const citationUrlMap = extractCitationUrls(doc);
+
+        let markdown = htmlToMarkdown(container, citationStyle, citationUrlMap);
+
+        // Strip pre-header metadata (SVG counter text, "Research completed..." line)
+        const headingMatch = markdown.match(/^(#{1,6}\s)/m);
+        if (headingMatch) {
+          markdown = markdown.substring(markdown.indexOf(headingMatch[0]));
+        }
+
+        const title = extractTitle();
+
+        // Collect citation data to send back to parent
+        const citations = {};
+        for (const [number, data] of globalCitations.citationRefs) {
+          citations[number] = data;
+        }
+
+        window.parent.postMessage({
+          type: "chatgpt-export-response",
+          markdown: markdown || "",
+          title,
+          citations,
+        }, "*");
+      });
+    });
+  }
+
+  // ============================================================================
   // INITIALIZATION
   // ============================================================================
 
   function init() {
+    // If running inside the deep research iframe, set up the bridge and exit
+    if (IS_IFRAME_CONTEXT) {
+      initIframeBridge();
+      return;
+    }
+
     let lastUrl = location.href;
 
     buildUI();
